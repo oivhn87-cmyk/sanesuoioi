@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>オンライン対応 ミニ・フォートナイト</title>
+    <style>
+        * { box-sizing: border-box; touch-action: none; }
+        body { margin: 0; overflow: hidden; background: #000; font-family: sans-serif; user-select: none; }
+        #ui { position: absolute; top: 10px; left: 10px; color: white; text-shadow: 1px 1px 3px #000; z-index: 10; pointer-events: none; }
+        #crosshair { position: absolute; top: 50%; left: 50%; width: 8px; height: 8px; background: rgba(255,255,255,0.8); border-radius: 50%; transform: translate(-50%, -50%); z-index: 10; pointer-events: none; }
+        
+        #joystick-container { position: absolute; bottom: 30px; left: 30px; width: 120px; height: 120px; background: rgba(255,255,255,0.2); border: 2px solid rgba(255,255,255,0.4); border-radius: 50%; z-index: 20; }
+        #joystick-knob { position: absolute; top: 35px; left: 35px; width: 50px; height: 50px; background: rgba(255,255,255,0.6); border-radius: 50%; }
+        
+        .btn-container { position: absolute; bottom: 30px; right: 20px; display: flex; flex-direction: column; gap: 15px; z-index: 20; }
+        .action-btn { width: 65px; height: 65px; border-radius: 50%; border: 2px solid #fff; color: white; font-weight: bold; display: flex; align-items: center; justify-content: center; }
+        #btn-shoot { background: rgba(220, 50, 50, 0.8); }
+        #btn-build { background: rgba(220, 140, 30, 0.8); }
+        #btn-jump { background: rgba(50, 150, 220, 0.8); }
+        #touch-look-area { position: absolute; top: 0; right: 0; width: 100%; height: 100%; z-index: 5; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+    <div id="ui"><b>オンライン ミニ・フォートナイト</b><br><span id="status">接続中...</span></div>
+    <div id="crosshair"></div>
+    <div id="touch-look-area"></div>
+    <div id="joystick-container"><div id="joystick-knob"></div></div>
+    
+    <div class="btn-container">
+        <div id="btn-shoot" class="action-btn">射撃</div>
+        <div id="btn-build" class="action-btn">建築</div>
+        <div id="btn-jump" class="action-btn">ジャンプ</div>
+    </div>
+
+    <script>
+        const socket = io();
+        const otherPlayers = {};
+
+        socket.on('connect', () => {
+            document.getElementById('status').innerText = 'オンライン接続完了！';
+        });
+
+        // 3Dシーン設定
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x60a0fe);
+        scene.fog = new THREE.Fog(0x60a0fe, 20, 100);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(20, 40, 20);
+        dirLight.castShadow = true;
+        scene.add(dirLight);
+
+        const floor = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), new THREE.MeshStandardMaterial({ color: 0x33aa33 }));
+        floor.rotation.x = -Math.PI / 2;
+        floor.receiveShadow = true;
+        scene.add(floor);
+
+        // 自分のプレイヤー
+        const playerGroup = new THREE.Group();
+        scene.add(playerGroup);
+        const playerMesh = new THREE.Mesh(new THREE.BoxGeometry(1, 2, 1), new THREE.MeshStandardMaterial({ color: 0x0055ff }));
+        playerMesh.position.y = 1;
+        playerGroup.add(playerMesh);
+
+        // 他プレイヤーのモデル生成関数
+        function createPlayerMesh(color) {
+            const mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 2, 1), new THREE.MeshStandardMaterial({ color: color }));
+            mesh.position.y = 1;
+            const group = new THREE.Group();
+            group.add(mesh);
+            scene.add(group);
+            return group;
+        }
+
+        // ソケット通信イベントのハンドリング
+        socket.on('currentPlayers', (players) => {
+            Object.keys(players).forEach((id) => {
+                if (id !== socket.id) {
+                    otherPlayers[id] = createPlayerMesh(players[id].color);
+                    otherPlayers[id].position.set(players[id].x, players[id].y, players[id].z);
+                }
+            });
+        });
+
+        socket.on('newPlayer', (info) => {
+            otherPlayers[info.id] = createPlayerMesh(info.color);
+        });
+
+        socket.on('playerMoved', (info) => {
+            if (otherPlayers[info.id]) {
+                otherPlayers[info.id].position.set(info.x, info.y, info.z);
+                otherPlayers[info.id].rotation.y = info.yaw;
+            }
+        });
+
+        socket.on('playerDisconnected', (id) => {
+            if (otherPlayers[id]) {
+                scene.remove(otherPlayers[id]);
+                delete otherPlayers[id];
+            }
+        });
+
+        socket.on('currentWalls', (walls) => { walls.forEach(data => addWallToScene(data)); });
+        socket.on('wallBuilt', (data) => { addWallToScene(data); });
+        socket.on('playerShot', (data) => { spawnBullet(data.pos, data.dir); });
+
+        // 壁の配置
+        function addWallToScene(data) {
+            const wall = new THREE.Mesh(new THREE.BoxGeometry(4, 3, 0.5), new THREE.MeshStandardMaterial({ color: 0x8b5a2b }));
+            wall.position.set(data.x, 1.5, data.z);
+            wall.rotation.y = data.yaw;
+            scene.add(wall);
+        }
+
+        // スマホ操作・移動計算
+        let yaw = 0, pitch = 0, moveInput = { x: 0, y: 0 };
+        let joyTouchId = null, joyStart = { x: 0, y: 0 };
+        const joyContainer = document.getElementById('joystick-container');
+        const joyKnob = document.getElementById('joystick-knob');
+
+        joyContainer.addEventListener('touchstart', (e) => {
+            const touch = e.changedTouches[0];
+            joyTouchId = touch.identifier;
+            joyStart = { x: touch.clientX, y: touch.clientY };
+        });
+
+        window.addEventListener('touchmove', (e) => {
+            for (let touch of e.changedTouches) {
+                if (touch.identifier === joyTouchId) {
+                    let dx = touch.clientX - joyStart.x, dy = touch.clientY - joyStart.y;
+                    const maxLen = 35, dist = Math.hypot(dx, dy);
+                    if (dist > maxLen) { dx = (dx/dist)*maxLen; dy = (dy/dist)*maxLen; }
+                    joyKnob.style.transform = `translate(${dx}px, ${dy}px)`;
+                    moveInput.x = dx / maxLen; moveInput.y = dy / maxLen;
+                }
+            }
+        });
+
+        const resetJoy = (e) => {
+            for (let touch of e.changedTouches) {
+                if (touch.identifier === joyTouchId) {
+                    joyTouchId = null;
+                    joyKnob.style.transform = 'translate(0px, 0px)';
+                    moveInput = { x: 0, y: 0 };
+                }
+            }
+        };
+        window.addEventListener('touchend', resetJoy);
+
+        // 視点移動
+        let lookTouchId = null, lastLook = { x: 0, y: 0 };
+        document.getElementById('touch-look-area').addEventListener('touchstart', (e) => {
+            for (let touch of e.changedTouches) {
+                if (touch.clientX > window.innerWidth * 0.3 && lookTouchId === null) {
+                    lookTouchId = touch.identifier;
+                    lastLook = { x: touch.clientX, y: touch.clientY };
+                }
+            }
+        });
+
+        window.addEventListener('touchmove', (e) => {
+            for (let touch of e.changedTouches) {
+                if (touch.identifier === lookTouchId) {
+                    yaw -= (touch.clientX - lastLook.x) * 0.005;
+                    pitch -= (touch.clientY - lastLook.y) * 0.005;
+                    pitch = Math.max(-Math.PI/4, Math.min(Math.PI/4, pitch));
+                    lastLook = { x: touch.clientX, y: touch.clientY };
+                }
+            }
+        });
+        window.addEventListener('touchend', (e) => {
+            for (let touch of e.changedTouches) { if (touch.identifier === lookTouchId) lookTouchId = null; }
+        });
+
+        // アクション機能
+        let velocityY = 0, isGrounded = true;
+        function jump() { if (isGrounded) { velocityY = 0.3; isGrounded = false; } }
+        
+        function buildWall() {
+            const front = new THREE.Vector3(0, 0, -1).applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+            const pos = playerGroup.position.clone().add(front.multiplyScalar(4));
+            socket.emit('buildWall', { x: pos.x, z: pos.z, yaw: yaw });
+        }
+
+        function shoot() {
+            const dir = new THREE.Vector3(0, 0, -1).applyAxisAngle(new THREE.Vector3(1, 0, 0), pitch).applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+            const pos = playerGroup.position.clone().add(new THREE.Vector3(0, 1.5, 0));
+            spawnBullet(pos, dir);
+            socket.emit('shoot', { pos: pos, dir: dir });
+        }
+
+        function spawnBullet(pos, dir) {
+            const bullet = new THREE.Mesh(new THREE.SphereGeometry(0.2), new THREE.MeshBasicMaterial({ color: 0xffff00 }));
+            bullet.position.copy(pos);
+            scene.add(bullet);
+            let dist = 0;
+            const timer = setInterval(() => {
+                bullet.position.addScaledVector(dir, 1);
+                if (++dist > 50) { scene.remove(bullet); clearInterval(timer); }
+            }, 16);
+        }
+
+        document.getElementById('btn-shoot').addEventListener('touchstart', (e) => { e.preventDefault(); shoot(); });
+        document.getElementById('btn-build').addEventListener('touchstart', (e) => { e.preventDefault(); buildWall(); });
+        document.getElementById('btn-jump').addEventListener('touchstart', (e) => { e.preventDefault(); jump(); });
+
+        // ループ処理
+        function animate() {
+            requestAnimationFrame(animate);
+
+            if (moveInput.x !== 0 || moveInput.y !== 0) {
+                const moveVector = new THREE.Vector3(moveInput.x, 0, moveInput.y).applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+                playerGroup.position.addScaledVector(moveVector, 0.15);
+            }
+
+            playerGroup.position.y += velocityY;
+            velocityY -= 0.015;
+            if (playerGroup.position.y <= 0) { playerGroup.position.y = 0; velocityY = 0; isGrounded = true; }
+            playerGroup.rotation.y = yaw;
+
+            // 自分の位置情報をサーバーへ送信
+            socket.emit('playerMove', {
+                x: playerGroup.position.x,
+                y: playerGroup.position.y,
+                z: playerGroup.position.z,
+                yaw: yaw
+            });
+
+            // カメラ追従
+            const camOffset = new THREE.Vector3(0, 2.5, 5).applyAxisAngle(new THREE.Vector3(1, 0, 0), pitch).applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+            camera.position.copy(playerGroup.position).add(camOffset);
+            camera.lookAt(playerGroup.position.clone().add(new THREE.Vector3(0, 1.5, 0)));
+
+            renderer.render(scene, camera);
+        }
+        animate();
+    </script>
+</body>
+</html>
